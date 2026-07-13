@@ -1,0 +1,19 @@
+# Secrets & live auth — never commit
+config.ini
+*.session
+*.session-journal
+
+# Runtime data
+feed_bot.db
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.DS_Store
+
+# Debug dialog dump (contains personal IDs)
+chats.txt

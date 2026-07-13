@@ -1,0 +1,18 @@
+[telephon]
+api_id = YOUR_API_ID
+api_hash = YOUR_API_HASH
+username = your_info
+user_id = YOUR_MAIN_ACCOUNT_USER_ID
+telephon_user_id = YOUR_SECONDARY_ACCOUNT_USER_ID
+
+[settings]
+target_channel = https://t.me/your_target_channel
+source_chats =
+    abualiexpress
+    aharonyediotnews
+    CaptainLoui
+    amitseg
+    yediotnews25
+    eye_on_ME
+rss_feeds =
+    https://rss.app/feeds/EXAMPLE.xml
