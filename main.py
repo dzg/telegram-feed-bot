@@ -6,8 +6,8 @@ import re
 import subprocess
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from telethon import TelegramClient, events, functions
+from datetime import datetime, timezone, timedelta
+from telethon import TelegramClient, events, functions, utils
 from telethon.extensions import html
 
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
@@ -64,7 +64,9 @@ for chat in raw_source_chats:
 raw_rss_feeds = config.get('settings', 'rss_feeds', fallback='').strip().split('\n')
 RSS_FEEDS = [feed.strip() for feed in raw_rss_feeds if feed.strip()]
 
-# Owner-only control commands: only this account's messages are honored.
+# The bot runs AS this account (its own user id). Control commands are honored
+# only in this account's Saved Messages (self-chat), which only the owner can
+# post to — so that chat is an inherently private, owner-only command surface.
 OWNER_ID = int(config.get('telephon', 'user_id'))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BOT_START_TIME = datetime.now(timezone.utc)
@@ -124,167 +126,226 @@ def get_message_link(chat_id, from_chat, message_id):
         clean_id = str(chat_id).replace('-100', '')
         return f"https://t.me/c/{clean_id}/{message_id}"
 
+async def process_single_message(message, from_chat, chat_id):
+    """Clean, translate, and send one (non-album) message to the target channel.
+
+    Shared by the live NewMessage handler and the /pull backfill. Returns True if
+    something was sent, False if skipped (duplicate/ad/empty)."""
+    chat_name = getattr(from_chat, 'title', str(chat_id))
+    msg_signature = f"{chat_id}_{message.id}"
+    if msg_signature in forwarded_message_ids:
+        logging.debug(f"Skipping already-seen message {message.id} in '{chat_name}'")
+        return False
+    forwarded_message_ids.add(msg_signature)
+
+    if is_ad(message):
+        logging.info(f"Dropped AD message from '{chat_name}' (Msg ID: {message.id})")
+        return False
+
+    # Raw HTML of the original message (preserves formatting)
+    original_html = html.unparse(getattr(message, 'message', ''), getattr(message, 'entities', []))
+    final_html_text, changed = filter_text(original_html)
+
+    if final_html_text:
+        try:
+            translation = await client(functions.messages.TranslateTextRequest(
+                peer=from_chat, id=[message.id], to_lang='en'))
+            if translation and translation.result:
+                translated_res = translation.result[0]
+                translated_html = html.unparse(translated_res.text, getattr(translated_res, 'entities', []))
+                final_html_text, _ = filter_text(translated_html)
+                changed = True
+                logging.info(f"Successfully translated message {message.id} from {chat_name}")
+        except Exception as translate_err:
+            logging.error(f"Failed to translate message {message.id}: {translate_err}")
+
+    if changed or getattr(message, 'text', ''):
+        logging.info(f"Sending TRANSLATED/MODIFIED message from '{chat_name}' (Msg ID: {message.id})")
+        msg_url = get_message_link(chat_id, from_chat, message.id)
+        new_text = f"{final_html_text}\n\n<a href='{msg_url}'>{chat_name}</a>"
+        await client.send_message(TARGET_CHANNEL, message=new_text, file=message.media, parse_mode='html', link_preview=False)
+    else:
+        logging.info(f"Forwarding NEW distinct message from '{chat_name}' (Msg ID: {message.id})")
+        await client.forward_messages(TARGET_CHANNEL, message)
+    return True
+
+
+async def process_album(messages, from_chat, chat_id):
+    """Clean, translate, and send a grouped-media album to the target channel.
+
+    Shared by the live Album handler and the /pull backfill. Returns True if sent."""
+    chat_name = getattr(from_chat, 'title', str(chat_id))
+    if not messages:
+        return False
+    grouped_id = getattr(messages[0], 'grouped_id', None)
+    if not grouped_id:
+        return False
+
+    msg_signature = f"{chat_id}_album_{grouped_id}"
+    if msg_signature in forwarded_message_ids:
+        logging.debug(f"Skipping already-seen album {grouped_id} in '{chat_name}'")
+        return False
+    forwarded_message_ids.add(msg_signature)
+
+    if any(is_ad(m) for m in messages):
+        logging.info(f"Dropped AD album from '{chat_name}' (Group ID: {grouped_id})")
+        return False
+
+    changed_any = False
+    new_caption = ""
+    message_ids_to_translate = [m.id for m in messages if getattr(m, 'text', None)]
+
+    translated_htmls = {}
+    if message_ids_to_translate:
+        try:
+            translation = await client(functions.messages.TranslateTextRequest(
+                peer=from_chat, id=message_ids_to_translate, to_lang='en'))
+            for i, res in enumerate(translation.result):
+                translated_htmls[message_ids_to_translate[i]] = html.unparse(res.text, getattr(res, 'entities', []))
+        except Exception as e:
+            logging.error(f"Failed to translate album {grouped_id}: {e}")
+
+    for m in messages:
+        original_html = html.unparse(getattr(m, 'message', ''), getattr(m, 'entities', []))
+        html_to_process = translated_htmls.get(m.id, original_html)
+        if not html_to_process:
+            continue
+        filtered_html, changed = filter_text(html_to_process)
+        if changed or m.id in translated_htmls:
+            changed_any = True
+        if not new_caption and filtered_html:
+            new_caption = filtered_html
+
+    if changed_any:
+        logging.info(f"Sending TRANSLATED/MODIFIED album from '{chat_name}' (Group ID: {grouped_id})")
+        msg_url = get_message_link(chat_id, from_chat, messages[0].id)
+        new_caption_final = f"{new_caption}\n\n<a href='{msg_url}'>{chat_name}</a>"
+        await client.send_message(TARGET_CHANNEL, message=new_caption_final, file=list(messages), parse_mode='html', link_preview=False)
+    else:
+        logging.info(f"Forwarding NEW distinct album from '{chat_name}' (Group ID: {grouped_id})")
+        await client.forward_messages(TARGET_CHANNEL, list(messages))
+    return True
+
+
 @client.on(events.NewMessage())
 async def forward_unique_messages(event):
-    """
-    Triggers on all new messages. Checks if it's from a target chat.
-    """
+    """Triggers on all new messages; forwards those from a source channel."""
     try:
-        # Ignore messages that are part of an album, they are handled by events.Album
+        # Albums are handled by the events.Album handler below
         if event.message.grouped_id:
             return
 
         chat_id = event.chat_id
         from_chat = await event.get_chat()
-        chat_name = getattr(from_chat, 'title', str(chat_id))
-        
-        # Check if it matches our desired channels list
-        if is_source_chat(chat_id, from_chat):
-            
-            # Mark the original message as read
-            try:
-                await client.send_read_acknowledge(from_chat, message=event.message)
-            except Exception as e:
-                logging.debug(f"Failed to mark message {event.message.id} as read: {e}")
-            
-            # Create a unique signature for this message so we don't double-forward it
-            # Using the chat ID and the message ID ensures uniqueness across channels.
-            msg_signature = f"{chat_id}_{event.message.id}"
-            
-            # If we haven't seen this message ID before...
-            if msg_signature not in forwarded_message_ids:
-                forwarded_message_ids.add(msg_signature)
-                
-                if is_ad(event.message):
-                    logging.info(f"Dropped AD message from '{chat_name}' (Msg ID: {event.message.id})")
-                    return
+        if not is_source_chat(chat_id, from_chat):
+            return
 
-                # First, get the raw HTML string representing the original message (with its original formatting)
-                original_html = html.unparse(getattr(event.message, 'message', ''), getattr(event.message, 'entities', []))
-                final_html_text, changed = filter_text(original_html)
-                
-                # Attempt to translate the text if it's not empty
-                if final_html_text:
-                    try:
-                        translation = await client(functions.messages.TranslateTextRequest(
-                            peer=from_chat,
-                            id=[event.message.id],
-                            to_lang='en'
-                        ))
-                        if translation and translation.result:
-                            # Unparse the translated text to preserve translated formatting
-                            translated_res = translation.result[0]
-                            translated_html = html.unparse(translated_res.text, getattr(translated_res, 'entities', []))
-                            final_html_text, _ = filter_text(translated_html)
-                            changed = True
-                            logging.info(f"Successfully translated message {event.message.id} from {chat_name}")
-                    except Exception as translate_err:
-                        logging.error(f"Failed to translate message {event.message.id}: {translate_err}")
+        try:
+            await client.send_read_acknowledge(from_chat, message=event.message)
+        except Exception as e:
+            logging.debug(f"Failed to mark message {event.message.id} as read: {e}")
 
-                if changed or getattr(event.message, 'text', ''):
-                    # We send it as a new message instead of forwarding so we can attach the translated text
-                    logging.info(f"Sending TRANSLATED/MODIFIED message from '{chat_name}' (Msg ID: {event.message.id})")
-                    msg_url = get_message_link(chat_id, from_chat, event.message.id)
-                    
-                    # Instead of HTML escaping final_text here, it's already HTML escaped and parsed via `html.unparse`
-                    new_text = f"{final_html_text}\n\n<a href='{msg_url}'>{chat_name}</a>"
-                    await client.send_message(TARGET_CHANNEL, message=new_text, file=event.message.media, parse_mode='html', link_preview=False)
-                else:
-                    logging.info(f"Forwarding NEW distinct message from '{chat_name}' (Msg ID: {event.message.id})")
-                    await client.forward_messages(TARGET_CHANNEL, event.message)
-                
-            else:
-                logging.debug(f"Ignored duplicate event for message {event.message.id} in '{chat_name}'")
-
+        await process_single_message(event.message, from_chat, chat_id)
     except Exception as e:
         logging.error(f"Error forwarding message: {e}")
 
+
 @client.on(events.Album())
 async def forward_unique_albums(event):
-    """
-    Triggers on grouped messages (albums).
-    """
+    """Triggers on grouped messages (albums) from a source channel."""
     try:
         chat_id = event.chat_id
         from_chat = await event.get_chat()
-        chat_name = getattr(from_chat, 'title', str(chat_id))
-        
-        # Check if it matches our desired channels list
-        if is_source_chat(chat_id, from_chat):
-            # We use the grouped_id to uniquely identify this album
-            # Since event.grouped_id might not exist directly on the Album object depending on the Telethon version, we can check the first message safely.
-            grouped_id = getattr(event, 'grouped_id', event.messages[0].grouped_id) if event.messages else None
-            
-            # Mark the album messages as read (using the max_id parameter)
-            try:
-                if event.messages:
-                    await client.send_read_acknowledge(from_chat, max_id=event.messages[-1].id)
-            except Exception as e:
-                logging.debug(f"Failed to mark album {grouped_id} as read: {e}")
-            
-            if not grouped_id:
-                return
+        if not is_source_chat(chat_id, from_chat):
+            return
 
-            msg_signature = f"{chat_id}_album_{grouped_id}"
-            
-            if msg_signature not in forwarded_message_ids:
-                forwarded_message_ids.add(msg_signature)
-                
-                if any(is_ad(m) for m in event.messages):
-                    logging.info(f"Dropped AD album from '{chat_name}' (Group ID: {grouped_id})")
-                    return
-                
-                changed_any = False
-                new_caption = ""
-                message_ids_to_translate = []
-                
-                for m in event.messages:
-                    if getattr(m, 'text', None):
-                        message_ids_to_translate.append(m.id)
+        try:
+            if event.messages:
+                await client.send_read_acknowledge(from_chat, max_id=event.messages[-1].id)
+        except Exception as e:
+            logging.debug(f"Failed to mark album as read: {e}")
 
-                translated_htmls = {}
-                if message_ids_to_translate:
-                    try:
-                        translation = await client(functions.messages.TranslateTextRequest(
-                            peer=from_chat,
-                            id=message_ids_to_translate,
-                            to_lang='en'
-                        ))
-                        for i, res in enumerate(translation.result):
-                            translated_htmls[message_ids_to_translate[i]] = html.unparse(res.text, getattr(res, 'entities', []))
-                    except Exception as e:
-                        logging.error(f"Failed to translate album {grouped_id}: {e}")
-
-                for m in event.messages:
-                    original_html = html.unparse(getattr(m, 'message', ''), getattr(m, 'entities', []))
-                    html_to_process = translated_htmls.get(m.id, original_html)
-                    
-                    if not html_to_process:
-                        continue
-                        
-                    filtered_html, changed = filter_text(html_to_process)
-                    # Any translation implies we modified it
-                    if changed or m.id in translated_htmls:
-                        changed_any = True
-                        
-                    if not new_caption and filtered_html:
-                        new_caption = filtered_html
-                
-                if changed_any:
-                    logging.info(f"Sending TRANSLATED/MODIFIED album from '{chat_name}' (Group ID: {grouped_id})")
-                    first_msg_id = event.messages[0].id if event.messages else grouped_id
-                    msg_url = get_message_link(chat_id, from_chat, first_msg_id)
-                    new_caption_final = f"{new_caption}\n\n<a href='{msg_url}'>{chat_name}</a>"
-                    await client.send_message(TARGET_CHANNEL, message=new_caption_final, file=event.messages, parse_mode='html', link_preview=False)
-                else:
-                    logging.info(f"Forwarding NEW distinct album from '{chat_name}' (Group ID: {grouped_id})")
-                    await client.forward_messages(TARGET_CHANNEL, event.messages)
-                
-            else:
-                logging.debug(f"Ignored duplicate event for album {grouped_id} in '{chat_name}'")
-
+        await process_album(event.messages, from_chat, chat_id)
     except Exception as e:
         logging.error(f"Error forwarding album: {e}")
+
+
+def parse_duration(text):
+    """Parse '2h', '90m', '1d' -> number of seconds. Returns None if invalid."""
+    m = re.match(r'^\s*(\d+)\s*([mhd])\s*$', text, re.IGNORECASE)
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2).lower()
+    if n <= 0:
+        return None
+    return n * {'m': 60, 'h': 3600, 'd': 86400}[unit]
+
+
+async def backfill_pull(seconds, max_per_source=200):
+    """Fetch every message newer than `seconds` ago from each source channel and
+    run it through the same clean/translate/republish pipeline. Albums are
+    regrouped so they post as a single album. Returns (total_sent, per_source)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    total_sent = 0
+    per_source = {}
+
+    for source in SOURCE_CHATS:
+        try:
+            entity = await client.get_entity(source)
+        except Exception as e:
+            logging.error(f"/pull: could not resolve source {source!r}: {e}")
+            per_source[str(source)] = f"⚠️ unresolved"
+            continue
+
+        chat_id = utils.get_peer_id(entity)
+        chat_name = getattr(entity, 'title', str(source))
+
+        # iter_messages yields newest-first; collect until we pass the cutoff
+        collected = []
+        try:
+            async for msg in client.iter_messages(entity, limit=max_per_source):
+                if msg.date < cutoff:
+                    break
+                if getattr(msg, 'action', None):  # skip service messages (joins/pins)
+                    continue
+                collected.append(msg)
+        except Exception as e:
+            logging.error(f"/pull: error reading {chat_name}: {e}")
+            per_source[chat_name] = f"⚠️ read error"
+            continue
+
+        collected.reverse()  # oldest-first so the target channel reads chronologically
+
+        # Regroup album items by grouped_id
+        albums = {}
+        for msg in collected:
+            gid = getattr(msg, 'grouped_id', None)
+            if gid:
+                albums.setdefault(gid, []).append(msg)
+
+        sent_here = 0
+        seen_groups = set()
+        for msg in collected:
+            try:
+                gid = getattr(msg, 'grouped_id', None)
+                if gid:
+                    if gid in seen_groups:
+                        continue
+                    seen_groups.add(gid)
+                    ok = await process_album(albums[gid], entity, chat_id)
+                else:
+                    ok = await process_single_message(msg, entity, chat_id)
+                if ok:
+                    sent_here += 1
+                    total_sent += 1
+                    await asyncio.sleep(1)  # gentle pacing to avoid flood limits
+            except Exception as e:
+                logging.error(f"/pull: failed on message {getattr(msg, 'id', '?')} in {chat_name}: {e}")
+
+        per_source[chat_name] = sent_here
+        logging.info(f"/pull: {chat_name} -> {sent_here} sent")
+
+    return total_sent, per_source
 
 async def poll_rss_feeds():
     seen_rss_links = set()
@@ -323,10 +384,12 @@ async def poll_rss_feeds():
         # Poll every 5 minutes
         await asyncio.sleep(300)
 
-@client.on(events.NewMessage(from_users=OWNER_ID, pattern=r'^/(status|ping|alive|channels|update|help)\b'))
+@client.on(events.NewMessage(pattern=r'^/(status|ping|alive|channels|pull|help)\b'))
 async def handle_owner_commands(event):
-    """Owner-only control commands, sent as a private message to this (bot) account."""
-    if not event.is_private:
+    """Control commands, sent in the bot account's own Saved Messages (self-chat)."""
+    # Saved Messages is the only chat whose id equals our own account id, and
+    # only we can post there — this is both the owner check and the scope filter.
+    if not (event.is_private and event.chat_id == OWNER_ID):
         return
     cmd = event.raw_text.split()[0].lstrip('/').lower()
     try:
@@ -342,28 +405,28 @@ async def handle_owner_commands(event):
         elif cmd == 'channels':
             listed = '\n'.join(f"• {s}" for s in SOURCE_CHATS) or '(none)'
             await event.reply(f"📡 **Source channels ({len(SOURCE_CHATS)}):**\n{listed}")
-        elif cmd == 'update':
-            await event.reply("⏳ Pulling latest from GitHub…")
-            rc, out = _run(['git', 'pull', '--ff-only'])
-            snippet = (out[-500:] if out else '(no output)')
-            if rc != 0:
-                await event.reply(f"❌ git pull failed:\n```\n{snippet}\n```")
+        elif cmd == 'pull':
+            parts = event.raw_text.split()
+            arg = parts[1] if len(parts) > 1 else ''
+            seconds = parse_duration(arg)
+            if not seconds:
+                await event.reply(
+                    "⚠️ Usage: `/pull 2h` or `/pull 1d` (units: `m` minutes, `h` hours, `d` days)."
+                )
                 return
-            if 'up to date' in out.lower():
-                await event.reply(f"✅ Already up to date.\n```\n{snippet}\n```")
-                return
-            await event.reply(f"✅ Pulled:\n```\n{snippet}\n```\n🔄 Restarting to apply…")
-            # Detached so the restart survives systemd killing this process.
-            subprocess.Popen(
-                ['bash', '-c', 'sleep 1; sudo systemctl restart telegram-feed-bot.service'],
-                start_new_session=True,
+            await event.reply(
+                f"⏳ Pulling the last **{arg}** from {len(SOURCE_CHATS)} feed(s), "
+                "cleaning/translating, and posting to the channel… this can take a while."
             )
+            total, per_source = await backfill_pull(seconds)
+            summary = '\n'.join(f"• {k}: {v}" for k, v in per_source.items()) or '(no sources)'
+            await event.reply(f"✅ Backfill complete — **{total}** item(s) posted.\n{summary}")
         elif cmd == 'help':
             await event.reply(
-                "🤖 **Commands** (owner only):\n"
+                "🤖 **Commands** (send here, in Saved Messages):\n"
                 "/status — alive check, uptime, version, sources\n"
                 "/channels — list source channels\n"
-                "/update — git pull + restart to apply\n"
+                "/pull `<time>` — backfill the last e.g. `2h` or `1d` from all feeds\n"
                 "/help — this message"
             )
     except Exception as e:

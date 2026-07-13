@@ -30,12 +30,14 @@ You will receive new posts from listed channels in the same dialogue.
 
 ## Control commands
 
-Send these as a private message to the bot account. They are accepted **only** from the owner account (`user_id` in `config.ini`):
+The bot logs in as your own user account, so its **Saved Messages** (the chat with yourself) is the command surface — only you can post there, and it's synced across your devices. Send these from any device into Saved Messages:
 
-- `/status` (or `/ping`) — confirm the bot is alive; shows uptime, git version, target, and source channels
+- `/status` (or `/ping`) — confirm the bot is alive; shows uptime, version, target, and source channels
 - `/channels` — list the configured source channels
-- `/update` — fast-forward `git pull` and restart to apply the new code
+- `/pull <time>` — backfill: fetch the last `<time>` of messages from **all** source feeds, clean/translate them, and post to the target channel. Time units: `m` (minutes), `h` (hours), `d` (days). Examples: `/pull 2h`, `/pull 90m`, `/pull 1d`.
 - `/help` — list available commands
+
+> `/pull` de-duplicates against what has already been forwarded during the current run, so overlapping windows won't double-post. Note that this de-dup memory resets when the service restarts.
 
 ## Running as a service (systemd)
 
@@ -59,4 +61,4 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Then: `sudo systemctl enable --now telegram-feed-bot`. The `/update` command requires the service user to be able to run `sudo systemctl restart telegram-feed-bot.service` without a password.
+Then: `sudo systemctl enable --now telegram-feed-bot`.
