@@ -1,9 +1,12 @@
 import logging
 import asyncio
 import configparser
+import os
 import re
+import subprocess
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from telethon import TelegramClient, events, functions
 from telethon.extensions import html
 
@@ -60,6 +63,40 @@ for chat in raw_source_chats:
 
 raw_rss_feeds = config.get('settings', 'rss_feeds', fallback='').strip().split('\n')
 RSS_FEEDS = [feed.strip() for feed in raw_rss_feeds if feed.strip()]
+
+# Owner-only control commands: only this account's messages are honored.
+OWNER_ID = int(config.get('telephon', 'user_id'))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BOT_START_TIME = datetime.now(timezone.utc)
+
+
+def _run(cmd):
+    """Run a shell command in the project dir, return (returncode, combined_output)."""
+    try:
+        r = subprocess.run(cmd, cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=120)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return -1, str(e)
+
+
+def _fmt_uptime():
+    secs = int((datetime.now(timezone.utc) - BOT_START_TIME).total_seconds())
+    d, secs = divmod(secs, 86400)
+    h, secs = divmod(secs, 3600)
+    m, _ = divmod(secs, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return " ".join(parts)
+
+
+def _git_version():
+    rc_b, branch = _run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])
+    rc_s, sha = _run(['git', 'rev-parse', '--short', 'HEAD'])
+    return f"{branch if rc_b == 0 else '?'} @ {sha if rc_s == 0 else '?'}"
 
 client = TelegramClient(username, api_id, api_hash, system_version="4.16.30-vxCUSTOM_STRING")
 
@@ -285,6 +322,57 @@ async def poll_rss_feeds():
         first_run = False
         # Poll every 5 minutes
         await asyncio.sleep(300)
+
+@client.on(events.NewMessage(from_users=OWNER_ID, pattern=r'^/(status|ping|alive|channels|update|help)\b'))
+async def handle_owner_commands(event):
+    """Owner-only control commands, sent as a private message to this (bot) account."""
+    if not event.is_private:
+        return
+    cmd = event.raw_text.split()[0].lstrip('/').lower()
+    try:
+        if cmd in ('status', 'ping', 'alive'):
+            sources = ', '.join(str(s) for s in SOURCE_CHATS) or '(none)'
+            await event.reply(
+                "✅ **Bot is alive**\n"
+                f"⏱ Uptime: {_fmt_uptime()}\n"
+                f"🔀 Version: {_git_version()}\n"
+                f"🎯 Target: {TARGET_CHANNEL}\n"
+                f"📡 Sources ({len(SOURCE_CHATS)}): {sources}"
+            )
+        elif cmd == 'channels':
+            listed = '\n'.join(f"• {s}" for s in SOURCE_CHATS) or '(none)'
+            await event.reply(f"📡 **Source channels ({len(SOURCE_CHATS)}):**\n{listed}")
+        elif cmd == 'update':
+            await event.reply("⏳ Pulling latest from GitHub…")
+            rc, out = _run(['git', 'pull', '--ff-only'])
+            snippet = (out[-500:] if out else '(no output)')
+            if rc != 0:
+                await event.reply(f"❌ git pull failed:\n```\n{snippet}\n```")
+                return
+            if 'up to date' in out.lower():
+                await event.reply(f"✅ Already up to date.\n```\n{snippet}\n```")
+                return
+            await event.reply(f"✅ Pulled:\n```\n{snippet}\n```\n🔄 Restarting to apply…")
+            # Detached so the restart survives systemd killing this process.
+            subprocess.Popen(
+                ['bash', '-c', 'sleep 1; sudo systemctl restart telegram-feed-bot.service'],
+                start_new_session=True,
+            )
+        elif cmd == 'help':
+            await event.reply(
+                "🤖 **Commands** (owner only):\n"
+                "/status — alive check, uptime, version, sources\n"
+                "/channels — list source channels\n"
+                "/update — git pull + restart to apply\n"
+                "/help — this message"
+            )
+    except Exception as e:
+        logging.error(f"Command '/{cmd}' failed: {e}")
+        try:
+            await event.reply(f"⚠️ Command error: {e}")
+        except Exception:
+            pass
+
 
 if __name__ == '__main__':
     client.start()
