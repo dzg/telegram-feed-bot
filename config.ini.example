@@ -1,6 +1,7 @@
 [telephon]
 api_id = YOUR_API_ID
 api_hash = YOUR_API_HASH
+bot_token = YOUR_BOTFATHER_BOT_TOKEN
 username = your_info
 user_id = YOUR_MAIN_ACCOUNT_USER_ID
 telephon_user_id = YOUR_SECONDARY_ACCOUNT_USER_ID

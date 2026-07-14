@@ -47,6 +47,10 @@ config.read('config.ini')
 username = config['telephon']['username']
 api_id = config['telephon']['api_id']
 api_hash = config['telephon']['api_hash']
+# Optional: a @BotFather bot token. If set, the bot exposes the control
+# commands (/status, /pull, …) in a normal chat with that bot — far more
+# discoverable than the account's Saved Messages. Empty = Saved Messages only.
+BOT_TOKEN = config.get('telephon', 'bot_token', fallback='').strip()
 
 TARGET_CHANNEL = config.get('settings', 'target_channel', fallback='https://t.me/newzzzzzil')
 
@@ -101,6 +105,11 @@ def _git_version():
     return f"{branch if rc_b == 0 else '?'} @ {sha if rc_s == 0 else '?'}"
 
 client = TelegramClient(username, api_id, api_hash, system_version="4.16.30-vxCUSTOM_STRING")
+
+# Second, optional client: a Bot-API bot used purely as the command surface.
+# It shares this process/event-loop with the user client, so its command
+# handlers can drive the same read/translate/republish pipeline.
+bot = TelegramClient('command_bot', api_id, api_hash) if BOT_TOKEN else None
 
 # We keep track of the messages we've already forwarded to prevent duplicates
 # from things like edits, grouped media (albums), or duplicate events.
@@ -384,13 +393,13 @@ async def poll_rss_feeds():
         # Poll every 5 minutes
         await asyncio.sleep(300)
 
-@client.on(events.NewMessage(pattern=r'^/(status|ping|alive|channels|pull|help)\b'))
-async def handle_owner_commands(event):
-    """Control commands, sent in the bot account's own Saved Messages (self-chat)."""
-    # Saved Messages is the only chat whose id equals our own account id, and
-    # only we can post there — this is both the owner check and the scope filter.
-    if not (event.is_private and event.chat_id == OWNER_ID):
-        return
+# Case-insensitive so "/Help" (phone auto-capitalisation) matches "/help".
+COMMAND_RE = re.compile(r'^/(status|ping|alive|channels|pull|help)\b', re.IGNORECASE)
+
+
+async def run_command(event):
+    """Execute a control command. Reached via two owner-only front doors:
+    the command bot (if configured) or the account's own Saved Messages."""
     cmd = event.raw_text.split()[0].lstrip('/').lower()
     try:
         if cmd in ('status', 'ping', 'alive'):
@@ -437,8 +446,36 @@ async def handle_owner_commands(event):
             pass
 
 
-if __name__ == '__main__':
-    client.start()
+@client.on(events.NewMessage(pattern=COMMAND_RE))
+async def _saved_messages_commands(event):
+    """Owner-only: commands typed in the user account's Saved Messages (self-chat)."""
+    if not (event.is_private and event.chat_id == OWNER_ID):
+        return
+    await run_command(event)
+
+
+def _register_bot_commands():
+    """Owner-only: commands sent to the @BotFather command bot, if configured."""
+    @bot.on(events.NewMessage(pattern=COMMAND_RE))
+    async def _bot_commands(event):
+        if event.sender_id != OWNER_ID:
+            return
+        await run_command(event)
+
+
+async def _main():
+    await client.start()
+    coros = [client.run_until_disconnected()]
+    if bot is not None:
+        _register_bot_commands()
+        await bot.start(bot_token=BOT_TOKEN)
+        me = await bot.get_me()
+        logging.info(f"Command bot online as @{me.username}")
+        coros.append(bot.run_until_disconnected())
     logging.info("Bot started successfully. Waiting for new posts (duplicate protection active)...")
-    client.loop.create_task(poll_rss_feeds())
-    client.run_until_disconnected()
+    asyncio.create_task(poll_rss_feeds())
+    await asyncio.gather(*coros)
+
+
+if __name__ == '__main__':
+    asyncio.run(_main())
