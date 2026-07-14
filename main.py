@@ -9,8 +9,30 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient, events, functions, utils
 from telethon.extensions import html
+from telethon.tl import types as tl_types, alltlobjects as tl_alltlobjects
 
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
+
+# --- Forward-compat schema shim ------------------------------------------------
+# Telegram's live servers can send a core type with a NEWER constructor id than
+# the published schema this Telethon was built against: adding a flag-gated field
+# changes the type's CRC, but the wire layout is identical for instances that
+# don't set the new field. Without a mapping, such an id raises TypeNotFoundError
+# deep in the update loop (getDifference) and crashes the whole process — dropping
+# a batch of live updates on every occurrence.
+#
+# Map each observed new id onto its known class so parsing succeeds. Verified by
+# decoding real crash bytes: 0x1c32b11c parses cleanly as `channel` (layout
+# identical to channel#d49f34c6) and lands exactly on the following object.
+# Add ids here as Telegram rolls new ones out ahead of the public schema.
+_FORWARD_COMPAT_CONSTRUCTORS = {
+    0x1c32b11c: 'Channel',   # `channel` with a post-layer-228 field added
+}
+for _cid, _clsname in _FORWARD_COMPAT_CONSTRUCTORS.items():
+    _cls = getattr(tl_types, _clsname, None)
+    if _cls is not None:
+        tl_alltlobjects.tlobjects.setdefault(_cid, _cls)
+        logging.info(f"Forward-compat: mapped constructor {hex(_cid)} -> {_clsname}")
 
 def is_ad(message):
     """True if the whole message should be dropped as an ad/promo, per the
