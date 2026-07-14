@@ -22,12 +22,14 @@ logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s'
 # deep in the update loop (getDifference) and crashes the whole process — dropping
 # a batch of live updates on every occurrence.
 #
-# Map each observed new id onto its known class so parsing succeeds. Verified by
-# decoding real crash bytes: 0x1c32b11c parses cleanly as `channel` (layout
-# identical to channel#d49f34c6) and lands exactly on the following object.
-# Add ids here as Telegram rolls new ones out ahead of the public schema.
+# Map each observed new id onto its known class so parsing succeeds. Each entry
+# was verified against real traffic before being added (decode the failing bytes
+# / re-fetch the failing history range with the shim and confirm sane objects and
+# full container alignment). Add ids here as Telegram rolls new ones out ahead of
+# the public schema — the symptom is TypeNotFoundError naming the id.
 _FORWARD_COMPAT_CONSTRUCTORS = {
-    0x1c32b11c: 'Channel',   # `channel` with a post-layer-228 field added
+    0x1c32b11c: 'Channel',   # `channel` with a post-layer-228 field (update stream)
+    0x3ae56482: 'Message',   # `message` with a post-layer-228 field (history reads)
 }
 for _cid, _clsname in _FORWARD_COMPAT_CONSTRUCTORS.items():
     _cls = getattr(tl_types, _clsname, None)
@@ -289,6 +291,29 @@ def get_message_link(chat_id, from_chat, message_id):
         clean_id = str(chat_id).replace('-100', '')
         return f"https://t.me/c/{clean_id}/{message_id}"
 
+async def _send_to_target(text, file=None):
+    """send_message with graceful degradation for Telegram's length limits:
+    media captions max ~1024 chars, text messages ~4096. A too-long caption is
+    reposted as text-only (keeping the full text + source link); a too-long text
+    is stripped of markup and truncated rather than lost."""
+    try:
+        await client.send_message(TARGET_CHANNEL, message=text, file=file,
+                                  parse_mode='html', link_preview=False)
+        return
+    except Exception as e:
+        low = str(e).lower()
+        if file is not None and 'caption' in low and 'long' in low:
+            logging.info("Caption too long for media — reposting as text-only")
+            file = None
+        elif 'too long' in low:
+            logging.info("Message too long — truncating")
+            text = re.sub(r'<[^>]+>', '', text)[:3900] + '…'
+        else:
+            raise
+    await client.send_message(TARGET_CHANNEL, message=text, file=file,
+                              parse_mode='html', link_preview=False)
+
+
 def _original_time_footer(original_date):
     """A small footer line with the post's ORIGINAL time in the configured
     display timezone ([settings] display_timezone, default ET), used on backfilled
@@ -346,7 +371,7 @@ async def process_single_message(message, from_chat, chat_id, original_date=None
         logging.info(f"Sending TRANSLATED/MODIFIED message from '{chat_name}' (Msg ID: {message.id})")
         msg_url = get_message_link(chat_id, from_chat, message.id)
         new_text = f"{final_html_text}\n\n<a href='{msg_url}'>{chat_name}</a>{_original_time_footer(original_date)}"
-        await client.send_message(TARGET_CHANNEL, message=new_text, file=message.media, parse_mode='html', link_preview=False)
+        await _send_to_target(new_text, file=message.media)
     else:
         logging.info(f"Forwarding NEW distinct message from '{chat_name}' (Msg ID: {message.id})")
         await client.forward_messages(TARGET_CHANNEL, message)
@@ -405,7 +430,7 @@ async def process_album(messages, from_chat, chat_id, original_date=None):
         logging.info(f"Sending TRANSLATED/MODIFIED album from '{chat_name}' (Group ID: {grouped_id})")
         msg_url = get_message_link(chat_id, from_chat, messages[0].id)
         new_caption_final = f"{new_caption}\n\n<a href='{msg_url}'>{chat_name}</a>{_original_time_footer(original_date)}"
-        await client.send_message(TARGET_CHANNEL, message=new_caption_final, file=list(messages), parse_mode='html', link_preview=False)
+        await _send_to_target(new_caption_final, file=list(messages))
     else:
         logging.info(f"Forwarding NEW distinct album from '{chat_name}' (Group ID: {grouped_id})")
         await client.forward_messages(TARGET_CHANNEL, list(messages))
@@ -518,6 +543,16 @@ async def poll_sources():
     logging.info(f"Polling {len(SOURCE_CHATS)} sources every {POLL_INTERVAL}s "
                  f"(state: {STATE_PATH})")
     while True:
+        # Self-heal: a mid-read parse error (or network blip) can drop the
+        # connection; Telethon won't always restore it for request-only clients.
+        if not client.is_connected():
+            logging.warning("poll: user client disconnected — reconnecting")
+            try:
+                await client.connect()
+            except Exception as e:
+                logging.error(f"poll: reconnect failed (will retry next cycle): {e}")
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
         for source in SOURCE_CHATS:
             try:
                 n = await _poll_one_source(source, state, entities)
