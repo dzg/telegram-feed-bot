@@ -41,9 +41,12 @@ def filter_text(text):
 
     kept = []
     for line in text.split('\n'):
-        if any(rx.search(line) for rx in DROP_LINE_RES):
+        if any(rx.search(line) for rx in DROP_LINE_RES) or \
+           any(rx.search(line) for rx in DROP_LINE_REGEX):
             continue
         for rx in REMOVE_TEXT_RES:
+            line = rx.sub('', line)
+        for rx in REMOVE_TEXT_REGEX:
             line = rx.sub('', line)
         kept.append(line)
     text = '\n'.join(kept)
@@ -76,11 +79,29 @@ def _load_patterns(cfg, section, key):
     return out
 
 
+def _load_regex(cfg, section, key):
+    """Read a newline-separated list of raw regex patterns from [section].<key>
+    (not wildcard-escaped — full regex). Bad patterns are logged and skipped."""
+    raw = cfg.get(section, key, fallback='')
+    out = []
+    for line in raw.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        try:
+            out.append(re.compile(line, re.IGNORECASE))
+        except re.error as e:
+            logging.error(f"Bad regex in [{section}].{key}: {line!r} ({e})")
+    return out
+
+
 def _build_rules(cfg):
     """Compile every config-driven matching rule from a parsed config object."""
     return {
         'drop': _load_patterns(cfg, 'filters', 'drop_lines'),
         'remove': _load_patterns(cfg, 'filters', 'remove_text'),
+        'drop_re': _load_regex(cfg, 'filters', 'drop_lines_regex'),
+        'remove_re': _load_regex(cfg, 'filters', 'remove_text_regex'),
         'ad_text': _load_patterns(cfg, 'ad_detection', 'text_markers'),
         'ad_button': _load_patterns(cfg, 'ad_detection', 'button_markers'),
     }
@@ -91,6 +112,8 @@ def _build_rules(cfg):
 _rules = _build_rules(config)
 DROP_LINE_RES = _rules['drop']
 REMOVE_TEXT_RES = _rules['remove']
+DROP_LINE_REGEX = _rules['drop_re']
+REMOVE_TEXT_REGEX = _rules['remove_re']
 AD_TEXT_RES = _rules['ad_text']
 AD_BUTTON_RES = _rules['ad_button']
 try:
@@ -102,7 +125,8 @@ except OSError:
 def _reload_config_if_changed():
     """Cheap per-message check: if config.ini's mtime changed, recompile the
     filter/ad rules from it. Bad edits are logged and the previous rules kept."""
-    global DROP_LINE_RES, REMOVE_TEXT_RES, AD_TEXT_RES, AD_BUTTON_RES, _config_mtime
+    global DROP_LINE_RES, REMOVE_TEXT_RES, DROP_LINE_REGEX, REMOVE_TEXT_REGEX
+    global AD_TEXT_RES, AD_BUTTON_RES, _config_mtime
     try:
         mtime = os.path.getmtime(CONFIG_PATH)
     except OSError:
@@ -119,10 +143,12 @@ def _reload_config_if_changed():
         logging.error(f"config.ini changed but reload failed — keeping previous rules: {e}")
         return
     DROP_LINE_RES, REMOVE_TEXT_RES = r['drop'], r['remove']
+    DROP_LINE_REGEX, REMOVE_TEXT_REGEX = r['drop_re'], r['remove_re']
     AD_TEXT_RES, AD_BUTTON_RES = r['ad_text'], r['ad_button']
     logging.info(
         f"Rules reloaded from config.ini: {len(DROP_LINE_RES)} drop_lines, "
-        f"{len(REMOVE_TEXT_RES)} remove_text, {len(AD_TEXT_RES)} ad-text, "
+        f"{len(REMOVE_TEXT_RES)} remove_text, {len(DROP_LINE_REGEX)} drop_lines_regex, "
+        f"{len(REMOVE_TEXT_REGEX)} remove_text_regex, {len(AD_TEXT_RES)} ad-text, "
         f"{len(AD_BUTTON_RES)} ad-button markers"
     )
 
@@ -224,11 +250,28 @@ def get_message_link(chat_id, from_chat, message_id):
         clean_id = str(chat_id).replace('-100', '')
         return f"https://t.me/c/{clean_id}/{message_id}"
 
-async def process_single_message(message, from_chat, chat_id):
+def _original_time_footer(original_date):
+    """A small footer line with the post's ORIGINAL time (Israel local), used on
+    backfilled /pull posts — Telegram stamps the republished post at send time and
+    a channel post can't be backdated, so we surface the real time in the text."""
+    if not original_date:
+        return ""
+    dt = original_date
+    try:
+        from zoneinfo import ZoneInfo
+        dt = dt.astimezone(ZoneInfo('Asia/Jerusalem'))
+        stamp = dt.strftime('%d %b %Y, %H:%M')
+    except Exception:
+        stamp = dt.strftime('%d %b %Y, %H:%M UTC')
+    return f"\n🕓 {stamp}"
+
+
+async def process_single_message(message, from_chat, chat_id, original_date=None):
     """Clean, translate, and send one (non-album) message to the target channel.
 
-    Shared by the live NewMessage handler and the /pull backfill. Returns True if
-    something was sent, False if skipped (duplicate/ad/empty)."""
+    Shared by the live NewMessage handler and the /pull backfill. When
+    original_date is given (backfill), the post's original time is appended as a
+    footer. Returns True if something was sent, False if skipped."""
     _reload_config_if_changed()
     chat_name = getattr(from_chat, 'title', str(chat_id))
     msg_signature = f"{chat_id}_{message.id}"
@@ -261,7 +304,7 @@ async def process_single_message(message, from_chat, chat_id):
     if changed or getattr(message, 'text', ''):
         logging.info(f"Sending TRANSLATED/MODIFIED message from '{chat_name}' (Msg ID: {message.id})")
         msg_url = get_message_link(chat_id, from_chat, message.id)
-        new_text = f"{final_html_text}\n\n<a href='{msg_url}'>{chat_name}</a>"
+        new_text = f"{final_html_text}\n\n<a href='{msg_url}'>{chat_name}</a>{_original_time_footer(original_date)}"
         await client.send_message(TARGET_CHANNEL, message=new_text, file=message.media, parse_mode='html', link_preview=False)
     else:
         logging.info(f"Forwarding NEW distinct message from '{chat_name}' (Msg ID: {message.id})")
@@ -269,10 +312,11 @@ async def process_single_message(message, from_chat, chat_id):
     return True
 
 
-async def process_album(messages, from_chat, chat_id):
+async def process_album(messages, from_chat, chat_id, original_date=None):
     """Clean, translate, and send a grouped-media album to the target channel.
 
-    Shared by the live Album handler and the /pull backfill. Returns True if sent."""
+    Shared by the live Album handler and the /pull backfill. When original_date is
+    given (backfill), the album's original time is appended. Returns True if sent."""
     _reload_config_if_changed()
     chat_name = getattr(from_chat, 'title', str(chat_id))
     if not messages:
@@ -319,7 +363,7 @@ async def process_album(messages, from_chat, chat_id):
     if changed_any:
         logging.info(f"Sending TRANSLATED/MODIFIED album from '{chat_name}' (Group ID: {grouped_id})")
         msg_url = get_message_link(chat_id, from_chat, messages[0].id)
-        new_caption_final = f"{new_caption}\n\n<a href='{msg_url}'>{chat_name}</a>"
+        new_caption_final = f"{new_caption}\n\n<a href='{msg_url}'>{chat_name}</a>{_original_time_footer(original_date)}"
         await client.send_message(TARGET_CHANNEL, message=new_caption_final, file=list(messages), parse_mode='html', link_preview=False)
     else:
         logging.info(f"Forwarding NEW distinct album from '{chat_name}' (Group ID: {grouped_id})")
@@ -432,9 +476,11 @@ async def backfill_pull(seconds, max_per_source=200):
                     if gid in seen_groups:
                         continue
                     seen_groups.add(gid)
-                    ok = await process_album(albums[gid], entity, chat_id)
+                    ok = await process_album(albums[gid], entity, chat_id,
+                                             original_date=albums[gid][0].date)
                 else:
-                    ok = await process_single_message(msg, entity, chat_id)
+                    ok = await process_single_message(msg, entity, chat_id,
+                                                      original_date=msg.date)
                 if ok:
                     sent_here += 1
                     total_sent += 1

@@ -27,11 +27,17 @@ rss_feeds =
 drop_lines =
     *abualiexpress.com/*
     *Click here to respond to the article*
+    *Click here to comment on the article*
     New! *Aharon Yediot* App
     Download for iPhone:*
     Download for Android:*
 remove_text =
     https://t.me/yediotnews25
+# drop_lines_regex / remove_text_regex use REAL regex (not wildcards) for precise
+# patterns — e.g. strip a standalone comment-count line like "12 comments"/"One comment":
+drop_lines_regex =
+    ^\s*(\d+|one)\s+comments?\s*$
+remove_text_regex =
 
 [ad_detection]
 # Whole-message drop rules ('*' = wildcard, literal + case-insensitive otherwise).

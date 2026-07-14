@@ -61,6 +61,13 @@ everything else is matched literally, case-insensitively.
 
 - `drop_lines` — remove any whole line that matches (best for promo footers)
 - `remove_text` — delete just the matched substring, keeping the rest of the line
+- `drop_lines_regex` / `remove_text_regex` — same, but the patterns are **real
+  regex** (not wildcards), for precise cases the `*` wildcard can't express — e.g.
+  `^\s*(\d+|one)\s+comments?\s*$` to strip a standalone "12 comments" line without
+  touching real text that merely mentions "comment"
+
+Backfilled `/pull` posts also get a `🕓 <original time>` footer (Israel local),
+since a republished channel post is stamped at send time and can't be backdated.
 
 `[ad_detection]` — drop the **entire** message as an ad/promo:
 
