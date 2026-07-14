@@ -394,7 +394,7 @@ async def poll_rss_feeds():
         await asyncio.sleep(300)
 
 # Case-insensitive so "/Help" (phone auto-capitalisation) matches "/help".
-COMMAND_RE = re.compile(r'^/(status|ping|alive|channels|pull|help)\b', re.IGNORECASE)
+COMMAND_RE = re.compile(r'^/(start|status|ping|alive|channels|pull|help)\b', re.IGNORECASE)
 
 
 async def run_command(event):
@@ -430,7 +430,7 @@ async def run_command(event):
             total, per_source = await backfill_pull(seconds)
             summary = '\n'.join(f"• {k}: {v}" for k, v in per_source.items()) or '(no sources)'
             await event.reply(f"✅ Backfill complete — **{total}** item(s) posted.\n{summary}")
-        elif cmd == 'help':
+        elif cmd in ('help', 'start'):
             await event.reply(
                 "🤖 **Commands** (send here, in Saved Messages):\n"
                 "/status — alive check, uptime, version, sources\n"
