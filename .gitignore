@@ -17,3 +17,4 @@ __pycache__/
 
 # Debug dialog dump (contains personal IDs)
 chats.txt
+state.json

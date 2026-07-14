@@ -26,11 +26,24 @@ pip install -r requirements.txt
 
 3. Enter your data in config.ini (you have received *api_id* and *api_hash* after Telephon installation; you can find your main account *user_id* and your secondary account *telephon_user_id* with @userinfobot)
 
-## How to use
+## How it works (poll-based ingestion)
 
-You can add a channel to feed by forwarding a message from it to the secondary account (*telephon_user_id*). If channel is already in the database, forwarding a message will remove it from feed. To check up channels list, send '/channels'.
+The bot signs in as a regular user account and, every `poll_interval` seconds
+(default 120, `[settings]` in config.ini), asks each channel in `source_chats`
+for messages newer than the last one it processed. New posts are cleaned
+([filters]), ad-checked ([ad_detection]), translated to English (Telegram's
+server-side translation), and republished to `target_channel`. Albums are
+reposted whole (a short grace window lets multi-part albums finish uploading).
 
-You will receive new posts from listed channels in the same dialogue.
+Progress is persisted per source in `state.json`, so restarts never double-post
+or lose position. A failure on one source is logged and retried next cycle —
+it never affects other sources or the process.
+
+> Design note: ingestion deliberately POLLS channel history instead of consuming
+> Telegram's push-update stream. History reads are a small, stable API surface;
+> the update stream's undocumented schema churn repeatedly crashed the process
+> (see vendor/BUILD.md). Polling costs up to `poll_interval` of latency and one
+> cheap request per source per cycle in exchange for robustness.
 
 ## Control commands
 

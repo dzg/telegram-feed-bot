@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import configparser
+import json
 import os
 import re
 import subprocess
@@ -142,6 +143,7 @@ def _build_rules(cfg):
         'ad_text': _load_patterns(cfg, 'ad_detection', 'text_markers'),
         'ad_button': _load_patterns(cfg, 'ad_detection', 'button_markers'),
         'tz': _load_timezone(cfg),
+        'poll_interval': max(30, cfg.getint('settings', 'poll_interval', fallback=120)),
     }
 
 
@@ -155,6 +157,7 @@ REMOVE_TEXT_REGEX = _rules['remove_re']
 AD_TEXT_RES = _rules['ad_text']
 AD_BUTTON_RES = _rules['ad_button']
 DISPLAY_TZ = _rules['tz']
+POLL_INTERVAL = _rules['poll_interval']
 try:
     _config_mtime = os.path.getmtime(CONFIG_PATH)
 except OSError:
@@ -165,7 +168,7 @@ def _reload_config_if_changed():
     """Cheap per-message check: if config.ini's mtime changed, recompile the
     filter/ad rules from it. Bad edits are logged and the previous rules kept."""
     global DROP_LINE_RES, REMOVE_TEXT_RES, DROP_LINE_REGEX, REMOVE_TEXT_REGEX
-    global AD_TEXT_RES, AD_BUTTON_RES, DISPLAY_TZ, _config_mtime
+    global AD_TEXT_RES, AD_BUTTON_RES, DISPLAY_TZ, POLL_INTERVAL, _config_mtime
     try:
         mtime = os.path.getmtime(CONFIG_PATH)
     except OSError:
@@ -185,6 +188,7 @@ def _reload_config_if_changed():
     DROP_LINE_REGEX, REMOVE_TEXT_REGEX = r['drop_re'], r['remove_re']
     AD_TEXT_RES, AD_BUTTON_RES = r['ad_text'], r['ad_button']
     DISPLAY_TZ = r['tz']
+    POLL_INTERVAL = r['poll_interval']
     logging.info(
         f"Rules reloaded from config.ini: {len(DROP_LINE_RES)} drop_lines, "
         f"{len(REMOVE_TEXT_RES)} remove_text, {len(DROP_LINE_REGEX)} drop_lines_regex, "
@@ -259,7 +263,14 @@ def _git_version():
     rc_s, sha = _run(['git', 'rev-parse', '--short', 'HEAD'])
     return f"{branch if rc_b == 0 else '?'} @ {sha if rc_s == 0 else '?'}"
 
-client = TelegramClient(username, api_id, api_hash, system_version="4.16.30-vxCUSTOM_STRING")
+# Ingestion is POLL-BASED (see poll_sources): we read each source's history on a
+# timer instead of consuming Telegram's push-update stream. History reads are a
+# far more stable API surface — the update stream's schema churn is what caused
+# repeated TypeNotFoundError process crashes. With a command bot configured, the
+# user client doesn't need updates at all, so the whole subsystem is turned off.
+# (Without a bot token, updates stay on so Saved Messages commands still work.)
+client = TelegramClient(username, api_id, api_hash, system_version="4.16.30-vxCUSTOM_STRING",
+                        receive_updates=not BOT_TOKEN)
 
 # Second, optional client: a Bot-API bot used purely as the command surface.
 # It shares this process/event-loop with the user client, so its command
@@ -269,18 +280,6 @@ bot = TelegramClient('command_bot', api_id, api_hash) if BOT_TOKEN else None
 # We keep track of the messages we've already forwarded to prevent duplicates
 # from things like edits, grouped media (albums), or duplicate events.
 forwarded_message_ids = set()
-
-def is_source_chat(chat_id, from_chat):
-    chat_name = getattr(from_chat, 'title', str(chat_id))
-    if chat_id in SOURCE_CHATS or chat_name in SOURCE_CHATS:
-        return True
-    
-    username = getattr(from_chat, 'username', None)
-    if username:
-        formats = [username, f"@{username}", f"t.me/{username}", f"https://t.me/{username}"]
-        source_strs = [s.lower() for s in SOURCE_CHATS if isinstance(s, str)]
-        return any(f.lower() in source_strs for f in formats)
-    return False
 
 def get_message_link(chat_id, from_chat, message_id):
     username = getattr(from_chat, 'username', None)
@@ -413,47 +412,122 @@ async def process_album(messages, from_chat, chat_id, original_date=None):
     return True
 
 
-@client.on(events.NewMessage())
-async def forward_unique_messages(event):
-    """Triggers on all new messages; forwards those from a source channel."""
+# ---------------------------------------------------------------------------
+# Ingestion engine: history polling.
+#
+# Every POLL_INTERVAL seconds, ask each source for "messages newer than the last
+# id I processed" (one cheap getHistory request per source) and run them through
+# the same clean/translate/republish pipeline as /pull. Compared to the previous
+# push-update handlers this is dramatically more robust: no dependency on
+# Telegram's update-stream schema (whose churn crashed the process), per-source
+# errors just skip a cycle, and progress is persisted to disk so restarts never
+# double-post or lose position.
+# ---------------------------------------------------------------------------
+
+STATE_PATH = os.path.join(SCRIPT_DIR, 'state.json')
+POLL_GRACE_SECONDS = 30   # let in-flight albums finish uploading before ingesting
+POLL_MAX_PER_CYCLE = 200  # safety cap per source per cycle
+LAST_POLL_TIME = None     # for /status
+
+
+def _load_state():
+    """last-processed message id per source, persisted across restarts."""
     try:
-        # Albums are handled by the events.Album handler below
-        if event.message.grouped_id:
-            return
-
-        chat_id = event.chat_id
-        from_chat = await event.get_chat()
-        if not is_source_chat(chat_id, from_chat):
-            return
-
-        try:
-            await client.send_read_acknowledge(from_chat, message=event.message)
-        except Exception as e:
-            logging.debug(f"Failed to mark message {event.message.id} as read: {e}")
-
-        await process_single_message(event.message, from_chat, chat_id)
-    except Exception as e:
-        logging.error(f"Error forwarding message: {e}")
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-@client.on(events.Album())
-async def forward_unique_albums(event):
-    """Triggers on grouped messages (albums) from a source channel."""
-    try:
-        chat_id = event.chat_id
-        from_chat = await event.get_chat()
-        if not is_source_chat(chat_id, from_chat):
-            return
+def _save_state(state):
+    tmp = STATE_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(state, f, indent=0)
+    os.replace(tmp, STATE_PATH)
 
-        try:
-            if event.messages:
-                await client.send_read_acknowledge(from_chat, max_id=event.messages[-1].id)
-        except Exception as e:
-            logging.debug(f"Failed to mark album as read: {e}")
 
-        await process_album(event.messages, from_chat, chat_id)
-    except Exception as e:
-        logging.error(f"Error forwarding album: {e}")
+async def _poll_one_source(source, state, entities):
+    """Fetch and process everything new in one source. Updates state on success."""
+    key = str(source)
+    ent = entities.get(key)
+    if ent is None:
+        ent = await client.get_entity(source)
+        entities[key] = ent
+    chat_id = utils.get_peer_id(ent)
+
+    last_id = state.get(key)
+    if last_id is None:
+        # First time we see this source: baseline at its newest message and start
+        # forwarding from the NEXT one (use /pull for history).
+        newest = await client.get_messages(ent, limit=1)
+        state[key] = newest[0].id if newest else 0
+        _save_state(state)
+        logging.info(f"poll: baseline {key} at msg id {state[key]}")
+        return 0
+
+    collected = []
+    async for m in client.iter_messages(ent, min_id=last_id, limit=POLL_MAX_PER_CYCLE):
+        if getattr(m, 'action', None):  # service messages (pins/joins)
+            continue
+        collected.append(m)
+    if not collected:
+        return 0
+
+    # Grace window: defer very fresh messages (and any album a fresh item belongs
+    # to) until next cycle, so multi-part albums are always ingested whole.
+    grace = datetime.now(timezone.utc) - timedelta(seconds=POLL_GRACE_SECONDS)
+    defer_gids = {m.grouped_id for m in collected if m.date > grace and m.grouped_id}
+    collected = [m for m in collected
+                 if m.date <= grace and (not m.grouped_id or m.grouped_id not in defer_gids)]
+    if not collected:
+        return 0
+
+    collected.reverse()  # oldest-first, chronological in the target channel
+
+    albums = {}
+    for m in collected:
+        if m.grouped_id:
+            albums.setdefault(m.grouped_id, []).append(m)
+
+    sent = 0
+    seen_groups = set()
+    for m in collected:
+        gid = m.grouped_id
+        if gid:
+            if gid in seen_groups:
+                continue
+            seen_groups.add(gid)
+            ok = await process_album(albums[gid], ent, chat_id)
+        else:
+            ok = await process_single_message(m, ent, chat_id)
+        if ok:
+            sent += 1
+            await asyncio.sleep(1)  # gentle pacing
+
+    state[key] = max(m.id for m in collected)
+    _save_state(state)
+    return sent
+
+
+async def poll_sources():
+    """Main ingestion loop. A failure in one source never affects the others or
+    the process — it's logged and retried next cycle."""
+    global LAST_POLL_TIME
+    state = _load_state()
+    entities = {}
+    logging.info(f"Polling {len(SOURCE_CHATS)} sources every {POLL_INTERVAL}s "
+                 f"(state: {STATE_PATH})")
+    while True:
+        for source in SOURCE_CHATS:
+            try:
+                n = await _poll_one_source(source, state, entities)
+                if n:
+                    logging.info(f"poll: {source} -> {n} new post(s)")
+            except Exception as e:
+                entities.pop(str(source), None)  # re-resolve next time
+                logging.error(f"poll: {source!r} failed this cycle (will retry): {e}")
+        LAST_POLL_TIME = datetime.now(timezone.utc)
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 def parse_duration(text):
@@ -583,10 +657,16 @@ async def run_command(event):
     try:
         if cmd in ('status', 'ping', 'alive'):
             sources = ', '.join(str(s) for s in SOURCE_CHATS) or '(none)'
+            if LAST_POLL_TIME:
+                ago = int((datetime.now(timezone.utc) - LAST_POLL_TIME).total_seconds())
+                poll_line = f"🔁 Poll: every {POLL_INTERVAL}s (last cycle {ago}s ago)"
+            else:
+                poll_line = f"🔁 Poll: every {POLL_INTERVAL}s (first cycle pending)"
             await event.reply(
                 "✅ **Bot is alive**\n"
                 f"⏱ Uptime: {_fmt_uptime()}\n"
                 f"🔀 Version: {_git_version()}\n"
+                f"{poll_line}\n"
                 f"🎯 Target: {TARGET_CHANNEL}\n"
                 f"📡 Sources ({len(SOURCE_CHATS)}): {sources}"
             )
@@ -611,7 +691,7 @@ async def run_command(event):
             await event.reply(f"✅ Backfill complete — **{total}** item(s) posted.\n{summary}")
         elif cmd in ('help', 'start'):
             await event.reply(
-                "🤖 **Commands** (send here, in Saved Messages):\n"
+                "🤖 **Commands** (send them right here):\n"
                 "/status — alive check, uptime, version, sources\n"
                 "/channels — list source channels\n"
                 "/pull `<time>` — backfill the last e.g. `2h` or `1d` from all feeds\n"
@@ -684,16 +764,32 @@ async def check_schema_layer():
         logging.info(f"Schema layer OK (build {our_layer}, current {current}).")
 
 
+async def _run_updates_forever(c, name):
+    """Keep a client's update loop alive. A parse error in the update stream
+    (Telegram schema churn) costs only that batch — it must never kill the
+    process, which is exactly what run_until_disconnected() does by re-raising."""
+    while True:
+        try:
+            await c.run_until_disconnected()
+            return  # genuine disconnect (shutdown)
+        except Exception as e:
+            logging.error(f"{name}: update-loop error (recovering): {e}")
+            await asyncio.sleep(5)
+
+
 async def _main():
     await client.start()
-    coros = [client.run_until_disconnected()]
+    coros = [poll_sources()]
     if bot is not None:
         _register_bot_commands()
         await bot.start(bot_token=BOT_TOKEN)
         me = await bot.get_me()
         logging.info(f"Command bot online as @{me.username}")
-        coros.append(bot.run_until_disconnected())
-    logging.info("Bot started successfully. Waiting for new posts (duplicate protection active)...")
+        coros.append(_run_updates_forever(bot, 'command-bot'))
+    else:
+        # No command bot: the user client keeps its update loop for Saved Messages commands.
+        coros.append(_run_updates_forever(client, 'client'))
+    logging.info("Bot started successfully (poll-based ingestion).")
     asyncio.create_task(poll_rss_feeds())
     asyncio.create_task(check_schema_layer())
     await asyncio.gather(*coros)
