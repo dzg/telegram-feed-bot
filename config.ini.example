@@ -32,3 +32,13 @@ drop_lines =
     Download for Android:*
 remove_text =
     https://t.me/yediotnews25
+
+[ad_detection]
+# Whole-message drop rules ('*' = wildcard, literal + case-insensitive otherwise).
+#   text_markers   — drop the message if its text matches any of these
+#   button_markers — drop the message if any inline button label matches
+text_markers =
+    תוכן שיווקי
+    Here are today's top stories on Telegram
+button_markers =
+    לפרסום

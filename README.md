@@ -46,14 +46,22 @@ fallback surface. Commands (case-insensitive):
 
 > `/pull` de-duplicates against what has already been forwarded during the current run, so overlapping windows won't double-post. Note that this de-dup memory resets when the service restarts.
 
-## Text filters
+## Filters & ad detection (config-driven, hot-reloaded)
 
-Message cleanup is config-driven — no code changes needed. In `config.ini` under
-`[filters]`, `*` is a wildcard (any run of characters) and everything else is
-matched literally, case-insensitively:
+All content rules live in `config.ini` — no code changes, and **no restart**: the
+service notices when `config.ini` changes on disk and recompiles the rules on the
+next message. In every list, `*` is a wildcard (any run of characters) and
+everything else is matched literally, case-insensitively.
+
+`[filters]` — clean up the text that *is* forwarded:
 
 - `drop_lines` — remove any whole line that matches (best for promo footers)
 - `remove_text` — delete just the matched substring, keeping the rest of the line
+
+`[ad_detection]` — drop the **entire** message as an ad/promo:
+
+- `text_markers` — drop if the message text matches
+- `button_markers` — drop if any inline-button label matches
 
 ```ini
 [filters]
@@ -63,9 +71,18 @@ drop_lines =
     Download for iPhone:*
 remove_text =
     https://t.me/yediotnews25
+
+[ad_detection]
+text_markers =
+    תוכן שיווקי
+    Here are today's top stories on Telegram
+button_markers =
+    לפרסום
 ```
 
-Filters are compiled at startup; edit and `sudo systemctl restart telegram-feed-bot` to apply.
+Just edit `config.ini` and save — changes take effect on the next incoming post.
+A malformed edit is logged and the previous rules are kept, so a typo never breaks
+the running service. (Source channels and tokens still require a restart.)
 
 ## Running as a service (systemd)
 

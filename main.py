@@ -13,14 +13,18 @@ from telethon.extensions import html
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s', level=logging.INFO)
 
 def is_ad(message):
+    """True if the whole message should be dropped as an ad/promo, per the
+    config-driven [ad_detection] markers (text markers + inline-button markers)."""
     text = getattr(message, 'text', '') or ''
-    if 'תוכן שיווקי' in text or "Here are today's top stories on Telegram" in text:
+    if any(rx.search(text) for rx in AD_TEXT_RES):
         return True
-    
-    if getattr(message, 'reply_markup', None) and hasattr(message.reply_markup, 'rows'):
-        for row in message.reply_markup.rows:
+
+    rm = getattr(message, 'reply_markup', None)
+    if rm is not None and hasattr(rm, 'rows'):
+        for row in rm.rows:
             for button in getattr(row, 'buttons', []):
-                if 'לפרסום' in getattr(button, 'text', ''):
+                btext = getattr(button, 'text', '') or ''
+                if any(rx.search(btext) for rx in AD_BUTTON_RES):
                     return True
     return False
 
@@ -50,19 +54,20 @@ def filter_text(text):
     changed = text != original_text
     return text, changed
 
+CONFIG_PATH = os.path.abspath('config.ini')
 config = configparser.ConfigParser(interpolation=None)
-config.read('config.ini')
+config.read(CONFIG_PATH)
 
 
 def _wildcard_to_regex(pattern):
-    """Compile a user filter pattern to a regex. '*' matches any run of
+    """Compile a user rule pattern to a regex. '*' matches any run of
     characters; every other character is treated literally. Case-insensitive."""
     return re.compile(re.escape(pattern).replace(r'\*', '.*'), re.IGNORECASE)
 
 
-def _load_filter_patterns(key):
-    """Read a newline-separated list of filter patterns from [filters].<key>."""
-    raw = config.get('filters', key, fallback='')
+def _load_patterns(cfg, section, key):
+    """Read a newline-separated list of wildcard patterns from [section].<key>."""
+    raw = cfg.get(section, key, fallback='')
     out = []
     for line in raw.split('\n'):
         line = line.strip()
@@ -71,10 +76,55 @@ def _load_filter_patterns(key):
     return out
 
 
-# Compiled once at startup. Editing [filters] in config.ini + restarting the
-# service is all that's needed to change what gets stripped — no code changes.
-DROP_LINE_RES = _load_filter_patterns('drop_lines')
-REMOVE_TEXT_RES = _load_filter_patterns('remove_text')
+def _build_rules(cfg):
+    """Compile every config-driven matching rule from a parsed config object."""
+    return {
+        'drop': _load_patterns(cfg, 'filters', 'drop_lines'),
+        'remove': _load_patterns(cfg, 'filters', 'remove_text'),
+        'ad_text': _load_patterns(cfg, 'ad_detection', 'text_markers'),
+        'ad_button': _load_patterns(cfg, 'ad_detection', 'button_markers'),
+    }
+
+
+# Rule sets used by filter_text() and is_ad(). Rebuilt automatically whenever
+# config.ini changes on disk (see _reload_config_if_changed) — no restart needed.
+_rules = _build_rules(config)
+DROP_LINE_RES = _rules['drop']
+REMOVE_TEXT_RES = _rules['remove']
+AD_TEXT_RES = _rules['ad_text']
+AD_BUTTON_RES = _rules['ad_button']
+try:
+    _config_mtime = os.path.getmtime(CONFIG_PATH)
+except OSError:
+    _config_mtime = None
+
+
+def _reload_config_if_changed():
+    """Cheap per-message check: if config.ini's mtime changed, recompile the
+    filter/ad rules from it. Bad edits are logged and the previous rules kept."""
+    global DROP_LINE_RES, REMOVE_TEXT_RES, AD_TEXT_RES, AD_BUTTON_RES, _config_mtime
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        return
+    if mtime == _config_mtime:
+        return
+    _config_mtime = mtime  # update first so a broken file doesn't retry every message
+    fresh = configparser.ConfigParser(interpolation=None)
+    try:
+        if not fresh.read(CONFIG_PATH):
+            return
+        r = _build_rules(fresh)
+    except Exception as e:
+        logging.error(f"config.ini changed but reload failed — keeping previous rules: {e}")
+        return
+    DROP_LINE_RES, REMOVE_TEXT_RES = r['drop'], r['remove']
+    AD_TEXT_RES, AD_BUTTON_RES = r['ad_text'], r['ad_button']
+    logging.info(
+        f"Rules reloaded from config.ini: {len(DROP_LINE_RES)} drop_lines, "
+        f"{len(REMOVE_TEXT_RES)} remove_text, {len(AD_TEXT_RES)} ad-text, "
+        f"{len(AD_BUTTON_RES)} ad-button markers"
+    )
 
 username = config['telephon']['username']
 api_id = config['telephon']['api_id']
@@ -179,6 +229,7 @@ async def process_single_message(message, from_chat, chat_id):
 
     Shared by the live NewMessage handler and the /pull backfill. Returns True if
     something was sent, False if skipped (duplicate/ad/empty)."""
+    _reload_config_if_changed()
     chat_name = getattr(from_chat, 'title', str(chat_id))
     msg_signature = f"{chat_id}_{message.id}"
     if msg_signature in forwarded_message_ids:
@@ -222,6 +273,7 @@ async def process_album(messages, from_chat, chat_id):
     """Clean, translate, and send a grouped-media album to the target channel.
 
     Shared by the live Album handler and the /pull backfill. Returns True if sent."""
+    _reload_config_if_changed()
     chat_name = getattr(from_chat, 'title', str(chat_id))
     if not messages:
         return False
