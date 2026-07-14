@@ -555,6 +555,47 @@ def _register_bot_commands():
         await run_command(event)
 
 
+# Source of Telegram's current schema (same one vendor/BUILD.md builds from).
+TL_SCHEMA_URL = ('https://raw.githubusercontent.com/telegramdesktop/tdesktop/'
+                 'dev/Telegram/SourceFiles/mtproto/scheme/api.tl')
+
+
+async def check_schema_layer():
+    """Best-effort startup check: warn if Telegram's current schema layer is
+    newer than the layer this Telethon build targets — an early heads-up that
+    /pull and live parsing may soon break. Rebuild per vendor/BUILD.md. Never
+    blocks startup and stays silent if the network is unavailable."""
+    try:
+        from telethon.tl import alltlobjects
+        our_layer = int(alltlobjects.LAYER)
+    except Exception:
+        return
+
+    def _fetch_current_layer():
+        req = urllib.request.Request(TL_SCHEMA_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = r.read().decode('utf-8', 'replace')
+        layers = [int(n) for n in re.findall(r'//\s*LAYER\s+(\d+)', data)]
+        return max(layers) if layers else None
+
+    try:
+        current = await asyncio.to_thread(_fetch_current_layer)
+    except Exception as e:
+        logging.info(f"Schema-layer check skipped (could not fetch current layer): {e}")
+        return
+    if not current:
+        return
+    if current > our_layer:
+        logging.warning(
+            f"⚠️ SCHEMA LAYER STALE: this Telethon targets layer {our_layer}, but "
+            f"Telegram's current layer is {current}. History reads (/pull) and live "
+            f"message parsing may break soon — rebuild the vendored Telethon "
+            f"(see vendor/BUILD.md)."
+        )
+    else:
+        logging.info(f"Schema layer OK (build {our_layer}, current {current}).")
+
+
 async def _main():
     await client.start()
     coros = [client.run_until_disconnected()]
@@ -566,6 +607,7 @@ async def _main():
         coros.append(bot.run_until_disconnected())
     logging.info("Bot started successfully. Waiting for new posts (duplicate protection active)...")
     asyncio.create_task(poll_rss_feeds())
+    asyncio.create_task(check_schema_layer())
     await asyncio.gather(*coros)
 
 

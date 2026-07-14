@@ -18,7 +18,9 @@ pip install -r requirements.txt
 > is only layer 227 and mis-parses current messages — it crash-loops the update
 > loop and breaks `/pull`. See `vendor/BUILD.md` for how it's built and how to
 > rebuild when Telegram bumps the layer again. Don't repin to a plain `telethon`
-> until PyPI ships a layer-228+ release.
+> until PyPI ships a layer-228+ release. On startup the bot checks Telegram's
+> current layer and logs `⚠️ SCHEMA LAYER STALE …` if it has moved ahead of this
+> build — watch `journalctl -u telegram-feed-bot` for that early warning.
 
 2. Set up Telephon ([documentation](https://docs.telethon.dev/en/stable/basic/signing-in.html)). When logging in with a terminal, use info of a secondary account - it will forward messages from channels to your main account.
 
