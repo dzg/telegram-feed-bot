@@ -1,1 +1,6 @@
-telethon~=1.44.0
+# Custom Telethon built against Telegram schema LAYER 228 (see vendor/BUILD.md).
+# The PyPI release (1.44.0) only speaks LAYER 227 and mis-parses current Telegram
+# messages: it crash-loops the update loop and breaks history reads (/pull).
+# Do NOT replace this with a plain "telethon" pin until PyPI ships a layer-228+
+# release. Install from the project root: pip install -r requirements.txt
+./vendor/telethon-1.42.0+layer228-py3-none-any.whl

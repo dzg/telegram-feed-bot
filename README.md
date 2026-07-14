@@ -12,11 +12,13 @@ FeedBot is a Telegram bot that will help you organize many separate channels int
 pip install -r requirements.txt
 ```
 
-or poetry:
-
-```
-poetry install
-```
+> **Telegram schema layer:** `requirements.txt` intentionally installs a
+> **vendored Telethon built against schema layer 228** (`vendor/`), not the PyPI
+> release. Telegram's servers are on layer 228; the newest PyPI Telethon (1.44.0)
+> is only layer 227 and mis-parses current messages — it crash-loops the update
+> loop and breaks `/pull`. See `vendor/BUILD.md` for how it's built and how to
+> rebuild when Telegram bumps the layer again. Don't repin to a plain `telethon`
+> until PyPI ships a layer-228+ release.
 
 2. Set up Telephon ([documentation](https://docs.telethon.dev/en/stable/basic/signing-in.html)). When logging in with a terminal, use info of a secondary account - it will forward messages from channels to your main account.
 
