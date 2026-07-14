@@ -25,24 +25,56 @@ def is_ad(message):
     return False
 
 def filter_text(text):
+    """Clean a message's (HTML) text using the config-driven [filters] rules.
+
+    `drop_lines` patterns remove any whole line they match; `remove_text`
+    patterns delete just the matched substring. In both, '*' is a wildcard and
+    everything else is literal. Returns (cleaned_text, changed?)."""
     if not text:
         return text, False
-    
+
     original_text = text.strip()
-    text = text.replace('https://t.me/yediotnews25', '')
-    text = re.sub(r'(?m)^.*https://abualiexpress\.com/.*', '', text)
-    
-    # Remove the specific phrase and its surrounding HTML link tags if present
-    text = re.sub(r'(?i)<a[^>]*>\s*Click here to respond to the article\s*</a>', '', text)
-    text = re.sub(r'(?i)Click here to respond to the article', '', text)
-    
-    text = text.strip()
-    
+
+    kept = []
+    for line in text.split('\n'):
+        if any(rx.search(line) for rx in DROP_LINE_RES):
+            continue
+        for rx in REMOVE_TEXT_RES:
+            line = rx.sub('', line)
+        kept.append(line)
+    text = '\n'.join(kept)
+
+    # Collapse blank lines any removal left behind
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+
     changed = text != original_text
     return text, changed
 
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(interpolation=None)
 config.read('config.ini')
+
+
+def _wildcard_to_regex(pattern):
+    """Compile a user filter pattern to a regex. '*' matches any run of
+    characters; every other character is treated literally. Case-insensitive."""
+    return re.compile(re.escape(pattern).replace(r'\*', '.*'), re.IGNORECASE)
+
+
+def _load_filter_patterns(key):
+    """Read a newline-separated list of filter patterns from [filters].<key>."""
+    raw = config.get('filters', key, fallback='')
+    out = []
+    for line in raw.split('\n'):
+        line = line.strip()
+        if line and not line.startswith('#'):
+            out.append(_wildcard_to_regex(line))
+    return out
+
+
+# Compiled once at startup. Editing [filters] in config.ini + restarting the
+# service is all that's needed to change what gets stripped — no code changes.
+DROP_LINE_RES = _load_filter_patterns('drop_lines')
+REMOVE_TEXT_RES = _load_filter_patterns('remove_text')
 
 username = config['telephon']['username']
 api_id = config['telephon']['api_id']
@@ -72,6 +104,13 @@ RSS_FEEDS = [feed.strip() for feed in raw_rss_feeds if feed.strip()]
 # only in this account's Saved Messages (self-chat), which only the owner can
 # post to — so that chat is an inherently private, owner-only command surface.
 OWNER_ID = int(config.get('telephon', 'user_id'))
+# Accounts allowed to issue commands to the command bot. The bot sees the
+# SENDER's user id, which — if you command from a different personal account
+# than the one the aggregator runs as — is NOT OWNER_ID. List those ids in
+# [telephon] command_user_ids (comma/space separated). OWNER_ID is always allowed.
+COMMAND_OWNER_IDS = {OWNER_ID} | {
+    int(x) for x in re.findall(r'\d+', config.get('telephon', 'command_user_ids', fallback=''))
+}
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BOT_START_TIME = datetime.now(timezone.utc)
 
@@ -458,7 +497,8 @@ def _register_bot_commands():
     """Owner-only: commands sent to the @BotFather command bot, if configured."""
     @bot.on(events.NewMessage(pattern=COMMAND_RE))
     async def _bot_commands(event):
-        if event.sender_id != OWNER_ID:
+        if event.sender_id not in COMMAND_OWNER_IDS:
+            logging.warning(f"BOT: ignoring command from non-owner sender {event.sender_id}")
             return
         await run_command(event)
 

@@ -4,6 +4,7 @@ api_hash = YOUR_API_HASH
 bot_token = YOUR_BOTFATHER_BOT_TOKEN
 username = your_info
 user_id = YOUR_MAIN_ACCOUNT_USER_ID
+command_user_ids = YOUR_OTHER_ACCOUNT_IDS_COMMA_SEPARATED
 telephon_user_id = YOUR_SECONDARY_ACCOUNT_USER_ID
 
 [settings]
@@ -17,3 +18,17 @@ source_chats =
     eye_on_ME
 rss_feeds =
     https://rss.app/feeds/EXAMPLE.xml
+
+[filters]
+# Modular text cleanup. '*' is a wildcard (any run of characters); everything
+# else is matched literally, case-insensitively. Edit + restart to apply.
+#   drop_lines  — remove any whole line that matches (best for promo footers)
+#   remove_text — delete just the matched substring, keep the rest of the line
+drop_lines =
+    *abualiexpress.com/*
+    *Click here to respond to the article*
+    New! *Aharon Yediot* App
+    Download for iPhone:*
+    Download for Android:*
+remove_text =
+    https://t.me/yediotnews25

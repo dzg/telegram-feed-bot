@@ -30,7 +30,14 @@ You will receive new posts from listed channels in the same dialogue.
 
 ## Control commands
 
-The bot logs in as your own user account, so its **Saved Messages** (the chat with yourself) is the command surface — only you can post there, and it's synced across your devices. Send these from any device into Saved Messages:
+The preferred command surface is a dedicated **@BotFather bot**. Create one with
+`/newbot` in [@BotFather](https://t.me/BotFather), put its token in
+`config.ini` under `[telephon] bot_token`, and message the bot directly. It's a
+normal, pinnable chat and its updates are delivered reliably. Commands are
+owner-only: the sender's user id must be `user_id` or one of `command_user_ids`
+(set the latter if you command from a *different* personal account than the one
+the aggregator runs as). The account's own **Saved Messages** still works as a
+fallback surface. Commands (case-insensitive):
 
 - `/status` (or `/ping`) — confirm the bot is alive; shows uptime, version, target, and source channels
 - `/channels` — list the configured source channels
@@ -38,6 +45,27 @@ The bot logs in as your own user account, so its **Saved Messages** (the chat wi
 - `/help` — list available commands
 
 > `/pull` de-duplicates against what has already been forwarded during the current run, so overlapping windows won't double-post. Note that this de-dup memory resets when the service restarts.
+
+## Text filters
+
+Message cleanup is config-driven — no code changes needed. In `config.ini` under
+`[filters]`, `*` is a wildcard (any run of characters) and everything else is
+matched literally, case-insensitively:
+
+- `drop_lines` — remove any whole line that matches (best for promo footers)
+- `remove_text` — delete just the matched substring, keeping the rest of the line
+
+```ini
+[filters]
+drop_lines =
+    *Click here to respond to the article*
+    New! *Aharon Yediot* App
+    Download for iPhone:*
+remove_text =
+    https://t.me/yediotnews25
+```
+
+Filters are compiled at startup; edit and `sudo systemctl restart telegram-feed-bot` to apply.
 
 ## Running as a service (systemd)
 
