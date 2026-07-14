@@ -66,8 +66,11 @@ everything else is matched literally, case-insensitively.
   `^\s*(\d+|one)\s+comments?\s*$` to strip a standalone "12 comments" line without
   touching real text that merely mentions "comment"
 
-Backfilled `/pull` posts also get a `🕓 <original time>` footer (Israel local),
-since a republished channel post is stamped at send time and can't be backdated.
+Backfilled `/pull` posts also get a `🕓 <original time>` footer, since a
+republished channel post is stamped at send time and can't be backdated. The
+timezone is `[settings] display_timezone` (IANA name; default `America/New_York`
+→ ET) and hot-reloads — change it to `America/Chicago`, `Asia/Jerusalem`, etc.
+and save; the zone abbreviation (EDT/CDT/…) is shown so it's unambiguous.
 
 `[ad_detection]` — drop the **entire** message as an ad/promo:
 

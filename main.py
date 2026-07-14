@@ -95,6 +95,21 @@ def _load_regex(cfg, section, key):
     return out
 
 
+def _load_timezone(cfg):
+    """Resolve [settings] display_timezone (IANA name, e.g. America/New_York) to a
+    tzinfo for the /pull original-time footer. Falls back to ET, then UTC."""
+    from zoneinfo import ZoneInfo
+    name = (cfg.get('settings', 'display_timezone', fallback='') or '').strip() or 'America/New_York'
+    try:
+        return ZoneInfo(name)
+    except Exception as e:
+        logging.error(f"Invalid display_timezone {name!r} ({e}); falling back to America/New_York")
+        try:
+            return ZoneInfo('America/New_York')
+        except Exception:
+            return None
+
+
 def _build_rules(cfg):
     """Compile every config-driven matching rule from a parsed config object."""
     return {
@@ -104,6 +119,7 @@ def _build_rules(cfg):
         'remove_re': _load_regex(cfg, 'filters', 'remove_text_regex'),
         'ad_text': _load_patterns(cfg, 'ad_detection', 'text_markers'),
         'ad_button': _load_patterns(cfg, 'ad_detection', 'button_markers'),
+        'tz': _load_timezone(cfg),
     }
 
 
@@ -116,6 +132,7 @@ DROP_LINE_REGEX = _rules['drop_re']
 REMOVE_TEXT_REGEX = _rules['remove_re']
 AD_TEXT_RES = _rules['ad_text']
 AD_BUTTON_RES = _rules['ad_button']
+DISPLAY_TZ = _rules['tz']
 try:
     _config_mtime = os.path.getmtime(CONFIG_PATH)
 except OSError:
@@ -126,7 +143,7 @@ def _reload_config_if_changed():
     """Cheap per-message check: if config.ini's mtime changed, recompile the
     filter/ad rules from it. Bad edits are logged and the previous rules kept."""
     global DROP_LINE_RES, REMOVE_TEXT_RES, DROP_LINE_REGEX, REMOVE_TEXT_REGEX
-    global AD_TEXT_RES, AD_BUTTON_RES, _config_mtime
+    global AD_TEXT_RES, AD_BUTTON_RES, DISPLAY_TZ, _config_mtime
     try:
         mtime = os.path.getmtime(CONFIG_PATH)
     except OSError:
@@ -145,6 +162,7 @@ def _reload_config_if_changed():
     DROP_LINE_RES, REMOVE_TEXT_RES = r['drop'], r['remove']
     DROP_LINE_REGEX, REMOVE_TEXT_REGEX = r['drop_re'], r['remove_re']
     AD_TEXT_RES, AD_BUTTON_RES = r['ad_text'], r['ad_button']
+    DISPLAY_TZ = r['tz']
     logging.info(
         f"Rules reloaded from config.ini: {len(DROP_LINE_RES)} drop_lines, "
         f"{len(REMOVE_TEXT_RES)} remove_text, {len(DROP_LINE_REGEX)} drop_lines_regex, "
@@ -251,18 +269,20 @@ def get_message_link(chat_id, from_chat, message_id):
         return f"https://t.me/c/{clean_id}/{message_id}"
 
 def _original_time_footer(original_date):
-    """A small footer line with the post's ORIGINAL time (Israel local), used on
-    backfilled /pull posts — Telegram stamps the republished post at send time and
-    a channel post can't be backdated, so we surface the real time in the text."""
+    """A small footer line with the post's ORIGINAL time in the configured
+    display timezone ([settings] display_timezone, default ET), used on backfilled
+    /pull posts — Telegram stamps the republished post at send time and a channel
+    post can't be backdated, so we surface the real time in the text."""
     if not original_date:
         return ""
     dt = original_date
-    try:
-        from zoneinfo import ZoneInfo
-        dt = dt.astimezone(ZoneInfo('Asia/Jerusalem'))
-        stamp = dt.strftime('%d %b %Y, %H:%M')
-    except Exception:
-        stamp = dt.strftime('%d %b %Y, %H:%M UTC')
+    if DISPLAY_TZ is not None:
+        try:
+            dt = dt.astimezone(DISPLAY_TZ)
+        except Exception:
+            pass
+    # %Z yields the zone abbreviation (EDT/EST/CDT/CST/UTC) so it's unambiguous.
+    stamp = dt.strftime('%d %b %Y, %H:%M %Z').strip()
     return f"\n🕓 {stamp}"
 
 

@@ -9,6 +9,9 @@ telephon_user_id = YOUR_SECONDARY_ACCOUNT_USER_ID
 
 [settings]
 target_channel = https://t.me/your_target_channel
+# Timezone for the "🕓 original time" footer on /pull backfilled posts (IANA name),
+# e.g. America/New_York (ET), America/Chicago (CT), Asia/Jerusalem.
+display_timezone = America/New_York
 source_chats =
     abualiexpress
     aharonyediotnews
